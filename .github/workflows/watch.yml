@@ -1,0 +1,41 @@
+name: MM小舖 戰鬥陀螺 監控
+
+on:
+  schedule:
+    # cron 是 UTC 時間。台灣時間 11:00~隔日01:30 大約對應 UTC 03:00~17:30
+    # 這裡排到 UTC 03:00~17:55，實際時段判斷交給 monitor.py 自己過濾
+    - cron: "*/5 3-17 * * *"
+  workflow_dispatch: {}   # 允許手動在 GitHub 網頁上點「Run workflow」測試
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "mm-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json || true
+          git diff --cached --quiet || git commit -m "update state [skip ci]"
+          git push || true
