@@ -1,3 +1,4 @@
+[README.md](https://github.com/user-attachments/files/31049521/README.md)
 # M.M小舖 戰鬥陀螺 監控機器人 v2（GitHub Actions + Telegram）
 
 監控頁面：https://mmtoyshop.com/category/🌀戰鬥陀螺
