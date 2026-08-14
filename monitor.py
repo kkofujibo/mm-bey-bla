@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-M.M小舖 戰鬥陀螺 監控腳本 v2
+M.M小舖 戰鬥陀螺 監控腳本 v5
 - 只在台灣時間 11:00 ~ 隔日 01:30 之間執行
-- 每次被 GitHub Actions 觸發（每5分鐘一次）後，內部自己每60秒重新抓取一次、共檢查5次，
-  等於在監控時段內達到「每分鐘檢查」的效果，且完全在GitHub Actions免費額度內（public repo不限額度）
-- 逐一比對每個商品的狀態標籤（例如『補貨中』『缺貨中』），
-  只要有商品從「補貨中/缺貨中」變成「非補貨中」（現貨/可下單），立刻推播 Telegram，
-  訊息附上該商品的完整連結，iPhone上點開Telegram會直接用內建網頁預覽打開，方便快速下單。
+- 每次觸發後，內部每60秒重新抓取一次、共檢查5次，約等於每分鐘檢查
+- 掃描整個分類頁（自動抓全部分頁，不用手動指定商品連結）：
+    https://mmtoyshop.com/category/🌀戰鬥陀螺?keyword=&page=N&sortType=&filters=&price=,
+- 逐一比對每個商品卡片上的「庫存 X」數字：
+    只要庫存 > 0（自動排除 0 與負數），且這是「新出現的可下單狀態」
+    （之前是0或沒看過，現在變成>0），就推播 Telegram，附上該商品連結
+- 每次檢查都會印出目前抓到的商品數與庫存清單，方便核對有沒有抓對
 """
 
 import os
@@ -20,22 +22,22 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 # ------------------- 設定區 -------------------
-TARGET_URL = "https://mmtoyshop.com/category/%F0%9F%8C%80%E6%88%B0%E9%AC%A5%E9%99%80%E8%9E%BA"
+CATEGORY_BASE = "https://mmtoyshop.com/category/%F0%9F%8C%80%E6%88%B0%E9%AC%A5%E9%99%80%E8%9E%BA"
 # 等同於 https://mmtoyshop.com/category/🌀戰鬥陀螺
+
+QUERY_SUFFIX = "keyword=&sortType=&filters=&price=,"
+
+# 目前已知共幾頁（61件商品/3頁），程式會嘗試自動偵測，抓不到才會用這個當備援上限
+FALLBACK_MAX_PAGES = 3
+# 保險上限，避免偵測異常時無限抓頁
+HARD_MAX_PAGES = 10
 
 STATE_FILE = "state.json"
 
 TAIPEI = timezone(timedelta(hours=8))
-WINDOW_START = (11, 0)   # 11:00
-WINDOW_END = (1, 30)     # 隔日 01:30
+WINDOW_START = (11, 0)
+WINDOW_END = (1, 30)
 
-# 視為「不可下單」的狀態關鍵字，可自行增減
-UNAVAILABLE_STATUSES = ["補貨中", "缺貨中", "缺貨", "已售完", "補貨"]
-
-# 只想盯特定系列/型號時，填入關鍵字（例如 ["UX-19", "限定"]）；留空代表全部商品都盯
-WATCH_KEYWORDS = []
-
-# 每次觸發後，內部檢查幾次、間隔幾秒（5次 x 60秒 = 涵蓋整個5分鐘排程區間）
 LOOP_TIMES = 5
 LOOP_INTERVAL_SEC = 60
 # ------------------------------------------------
@@ -60,7 +62,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"items": {}}  # { link: {"title": ..., "status": ..., "available": bool} }
+    return {"items": {}}
 
 
 def save_state(state):
@@ -68,47 +70,81 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_page():
+def fetch_page(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile Safari/604.1"
     }
-    resp = requests.get(TARGET_URL, headers=headers, timeout=20)
+    resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
     return resp.text
 
 
-def extract_items(html: str):
+def detect_total_pages(html: str) -> int:
+    """嘗試從頁面文字找出『共 X 頁』之類的資訊，找不到就用備援值"""
+    m = re.search(r'共\s*(\d+)\s*頁', html)
+    if m:
+        try:
+            n = int(m.group(1))
+            if 1 <= n <= HARD_MAX_PAGES:
+                return n
+        except ValueError:
+            pass
+    # 找不到就試試看用商品總數/每頁預設20~30筆換算，抓不到就用備援
+    return FALLBACK_MAX_PAGES
+
+
+def extract_products(html: str):
     """
-    解析商品標題與連結，例如：
-    [【M.M小舖】『預購』 6月 BANDAI ...](https://mmtoyshop.com/item/xxxxx)
-    回傳 dict: { link: {"title": 標題, "status": 狀態標籤或None} }
+    掃描頁面，抓出每個商品卡片的：庫存數字、商品名稱、連結
+    做法：找到每個「庫存 X」出現的位置，往後(或往前)一小段範圍內
+    找該商品的 <a href="https://mmtoyshop.com/item/...">商品名稱</a> 連結
+    回傳 list of dict: [{"link":..., "title":..., "stock": int}, ...]
     """
-    items = {}
-    pattern = re.findall(
-        r'\[([^\[\]]{4,120})\]\((https://mmtoyshop\.com/item/[^\)\s]+)\)',
-        html
-    )
-    for title, link in pattern:
-        title = title.strip()
-        if not title or "http" in title:
+    products = []
+    seen_links_this_page = set()
+
+    for m in re.finditer(r'庫存\s*(-?\d+)', html):
+        stock = int(m.group(1))
+        pos = m.end()
+
+        # 往後找最近的商品連結+標題（在圖片/空連結之後，通常是真正帶標題文字的那個<a>）
+        window = html[pos: pos + 800]
+        link_match = None
+        for lm in re.finditer(
+            r'<a[^>]+href="(https://mmtoyshop\.com/item/[^"]+)"[^>]*>\s*([^<]{2,120}?)\s*</a>',
+            window
+        ):
+            href, text = lm.group(1), lm.group(2).strip()
+            # 過濾掉空文字或看起來像路徑的錨點文字
+            if text and not text.startswith("/item"):
+                link_match = (href, text)
+                break
+
+        if not link_match:
+            # 往前找找看（保險，防止結構跟預期不同）
+            window_before = html[max(0, pos - 800): pos]
+            matches = list(re.finditer(
+                r'<a[^>]+href="(https://mmtoyshop\.com/item/[^"]+)"[^>]*>\s*([^<]{2,120}?)\s*</a>',
+                window_before
+            ))
+            for lm in reversed(matches):
+                href, text = lm.group(1), lm.group(2).strip()
+                if text and not text.startswith("/item"):
+                    link_match = (href, text)
+                    break
+
+        if not link_match:
             continue
-        status_match = re.search(r'『([^『』]{1,10})』', title)
-        status = status_match.group(1) if status_match else None
-        items[link] = {"title": title, "status": status}
-    return items
 
+        href, title = link_match
+        if href in seen_links_this_page:
+            continue
+        seen_links_this_page.add(href)
 
-def is_available(status):
-    if status is None:
-        return True
-    return not any(bad in status for bad in UNAVAILABLE_STATUSES)
+        products.append({"link": href, "title": title, "stock": stock})
 
-
-def matches_watch_keywords(title):
-    if not WATCH_KEYWORDS:
-        return True
-    return any(k in title for k in WATCH_KEYWORDS)
+    return products
 
 
 def send_telegram(text: str):
@@ -134,25 +170,44 @@ def send_telegram(text: str):
 
 def check_once(state):
     now_taipei = datetime.now(TAIPEI)
-    html = fetch_page()
-    current_items = extract_items(html)
+    items = state.get("items", {})
 
-    prev_items = state.get("items", {})
+    page1_url = f"{CATEGORY_BASE}?{QUERY_SUFFIX}&page=1"
+    try:
+        html_page1 = fetch_page(page1_url)
+    except Exception as e:
+        print(f"抓取第1頁失敗: {e}")
+        return state
+
+    total_pages = detect_total_pages(html_page1)
+    print(f"偵測到共 {total_pages} 頁")
+
+    all_products = []
+    for page in range(1, total_pages + 1):
+        if page == 1:
+            html = html_page1
+        else:
+            url = f"{CATEGORY_BASE}?{QUERY_SUFFIX}&page={page}"
+            try:
+                html = fetch_page(url)
+            except Exception as e:
+                print(f"抓取第{page}頁失敗: {e}")
+                continue
+
+        products = extract_products(html)
+        print(f"第{page}頁抓到 {len(products)} 個商品")
+        all_products.extend(products)
+
+    print(f"本次共抓到 {len(all_products)} 個商品，開始比對狀態...")
+
     triggered_any = False
+    for p in all_products:
+        link, title, stock = p["link"], p["title"], p["stock"]
+        now_available = stock > 0
 
-    for link, info in current_items.items():
-        title = info["title"]
-        status = info["status"]
-
-        if not matches_watch_keywords(title):
-            continue
-
-        now_available = is_available(status)
-        prev_info = prev_items.get(link)
+        prev_info = items.get(link)
         prev_available = prev_info["available"] if prev_info else None
 
-        # 觸發條件：以前是「不可下單」(False)，現在變成「可下單」(True)
-        # 或是全新出現的商品，且一出現就是可下單狀態
         newly_available = (
             (prev_available is False and now_available is True) or
             (prev_info is None and now_available is True)
@@ -160,23 +215,27 @@ def check_once(state):
 
         if newly_available:
             triggered_any = True
-            status_text = f"『{status}』" if status else "（無特別標記，判斷為可下單）"
             msg = (
-                "🌀 <b>M.M小舖 戰鬥陀螺 有新品項可下單！</b>\n\n"
+                "🌀 <b>M.M小舖 戰鬥陀螺 有商品可下單了！</b>\n\n"
                 f"商品：{title}\n"
-                f"狀態：{status_text}\n"
+                f"目前庫存：{stock}\n"
                 f"🔗 {link}\n\n"
                 f"偵測時間：{now_taipei.strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)"
             )
             send_telegram(msg)
-            print(f"[通知] {title} -> {link}")
+            print(f"[通知已發送] {title}（庫存{stock}） -> {link}")
 
-        current_items[link]["available"] = now_available
+        items[link] = {"title": title, "available": now_available, "stock": stock}
 
-    state["items"] = current_items
     if not triggered_any:
         print(f"[{now_taipei.strftime('%H:%M:%S')}] 檢查完成，無新的可下單品項。")
+        # 印出目前所有商品的庫存概況，方便核對抓取是否正確
+        for p in all_products[:10]:
+            print(f"  - {p['title'][:30]}｜庫存{p['stock']}")
+        if len(all_products) > 10:
+            print(f"  ...（其餘 {len(all_products)-10} 項省略）")
 
+    state["items"] = items
     return state
 
 
@@ -191,13 +250,11 @@ def main():
     for i in range(LOOP_TIMES):
         try:
             state = check_once(state)
-            save_state(state)  # 每次檢查後都存檔，避免中途失敗遺失進度
+            save_state(state)
         except Exception as e:
             print(f"第 {i+1} 次檢查發生錯誤: {e}", file=sys.stderr)
 
-        # 最後一次不用再等待
         if i < LOOP_TIMES - 1:
-            # 若已超出監控時段（例如剛好跨過01:30），提前結束
             if not in_watch_window(datetime.now(TAIPEI)):
                 print("已超出監控時段，提前結束本次任務。")
                 break
